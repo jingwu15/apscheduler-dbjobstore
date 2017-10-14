@@ -13,11 +13,6 @@ from sqlalchemy.sql.expression import null
 from sqlalchemy import create_engine, Table, Column, MetaData, Unicode, Float, Integer, SmallInteger, String, Text, DateTime, LargeBinary, select
 from tzlocal import get_localzone
 
-try:
-    import cPickle as pickle
-except ImportError:  # pragma: nocover
-    import pickle
-
 timezone = get_localzone()
 class DbJobStore(BaseJobStore):
     """
@@ -32,14 +27,11 @@ class DbJobStore(BaseJobStore):
     :param engine: an SQLAlchemy Engine to use instead of creating a new one based on ``url``
     :param str tablename: name of the table to store jobs in
     :param metadata: a :class:`~sqlalchemy.MetaData` instance to use instead of creating a new one
-    :param int pickle_protocol: pickle protocol level to use (for serialization), defaults to the
         highest available
     """
 
-    def __init__(self, url=None, engine=None, tablename='scheduler', metadata=None,
-                 pickle_protocol=pickle.HIGHEST_PROTOCOL):
+    def __init__(self, url=None, engine=None, tablename='scheduler', metadata=None):
         super(DbJobStore, self).__init__()
-        self.pickle_protocol = pickle_protocol
         metadata = maybe_ref(metadata) or MetaData()
 
         if engine:
