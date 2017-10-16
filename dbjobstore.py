@@ -1,6 +1,8 @@
 from __future__ import absolute_import
 
 import json
+import datetime
+from datetime import datetime
 from copy import deepcopy
 from apscheduler.jobstores.base import BaseJobStore, JobLookupError, ConflictingIdError
 from apscheduler.util import ref_to_obj, maybe_ref, datetime_to_utc_timestamp, utc_timestamp_to_datetime, astimezone, convert_to_datetime
@@ -10,9 +12,10 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.expression import null
-from sqlalchemy import create_engine, Table, Column, MetaData, Unicode, Float, Integer, SmallInteger, String, Text, DateTime, LargeBinary, select
+from sqlalchemy import create_engine, Table, Column, MetaData, Unicode, Float, Integer, SmallInteger, String, Text, DateTime, LargeBinary, select, TIMESTAMP
 from tzlocal import get_localzone
 
+cronMap = {'second':'S', 'minute':'M', 'hour':'H', 'day':'d', 'month':'m', 'day_of_week':'w', 'week':'W', 'year':'Y'}
 timezone = get_localzone()
 class DbJobStore(BaseJobStore):
     """
@@ -54,11 +57,11 @@ class DbJobStore(BaseJobStore):
             Column('trigger_type', Text, index=False),                       #触发器类型   interval/cron/date 
             Column('crontab', String(1000), index=False),                    #crontab
             Column('interval', Integer, index=False),                        #interval
-            Column('run_date', String(50), index=False),                     #datetime
+            Column('run_date', TIMESTAMP(timezone=True), index=False),       #datetime
             Column('coalesce', Integer, index=False),                        #False/True, default:False
-            Column('start_date', String(50), index=False),                   #开始时间，针对crontab/interval
-            Column('end_date', String(50), index=False),                     #结束时间，针对crontab/interval
-            Column('next_run_time', Float(50), index=False, default=''),     #下次执行时间
+            Column('start_date', TIMESTAMP(timezone=True), index=False),     #开始时间，针对crontab/interval
+            Column('end_date', TIMESTAMP(timezone=True), index=False),       #结束时间，针对crontab/interval
+            Column('next_run_time', TIMESTAMP(timezone=True), index=False),  #下次执行时间
             Column('max_instances', Integer, index=False, default=''),       #3
             Column('executor', String(50), index=False, default=''),         #default
             Column('misfire_grace_time', Integer, index=False, default=''),  #过时任务，是否补齐
@@ -78,13 +81,13 @@ class DbJobStore(BaseJobStore):
 
     def get_due_jobs(self, now):
         timestamp = datetime_to_utc_timestamp(now)
-        return self._get_jobs(self.jobs_t.c.next_run_time <= timestamp)
+        return self._get_jobs(self.jobs_t.c.next_run_time <= datetime.fromtimestamp(timestamp))
 
     def get_next_run_time(self):
         selectable = select([self.jobs_t.c.next_run_time]).where(self.jobs_t.c.next_run_time != null())
         selectable = selectable.order_by(self.jobs_t.c.next_run_time).limit(1)
         next_run_time = self.engine.execute(selectable).scalar()
-        return utc_timestamp_to_datetime(next_run_time)
+        return utc_timestamp_to_datetime(next_run_time.timestamp()) if next_run_time else ''
 
     def get_all_jobs(self):
         jobs = self._get_jobs()
@@ -146,7 +149,12 @@ class DbJobStore(BaseJobStore):
 
     def _db_to_job(self, row):
         if row['trigger_type'] == 'date': trigger = DateTrigger(run_date = row['run_date'])
-        if row['trigger_type'] == 'cron': trigger = CronTrigger(**json.loads(row['crontab']))
+        if row['trigger_type'] == 'cron':
+            keys = row['crontab'].split(',')[1]
+            values = row['crontab'].split(',')[0].split(' ')
+            cronMapRev = {v:k for k,v in cronMap.items()}
+            crontab = {cronMapRev[k]:values[i] for i,k in enumerate(keys)}
+            trigger = CronTrigger(**crontab)
         if row['trigger_type'] == 'interval': trigger = IntervalTrigger(seconds=row['interval'])
         job = Job.__new__(Job)
         job.__setstate__({
@@ -157,20 +165,22 @@ class DbJobStore(BaseJobStore):
             'kwargs': json.loads(row['kwargs']) if row['kwargs'] else {},
             'version': 1,
             'trigger': trigger,
-            'coalesce': row['coalesce'],
-            'next_run_time': utc_timestamp_to_datetime(row['next_run_time']),
             'executor': row['executor'],
+            'start_date': row['start_date'],
+            'end_date': row['end_date'],
+            'next_run_time': utc_timestamp_to_datetime(row['next_run_time'].timestamp()),
+            'coalesce': row['coalesce'],
             'misfire_grace_time': row['misfire_grace_time'],
             'max_instances': row['max_instances'],
             'jobstore': self,
         })
         job._scheduler = self._scheduler
         job._jobstore_alias = self._alias
+        print(job._scheduler)
+        print(job._jobstore_alias)
         return job
 
     def _job_to_db(self, job):
-        #datetime.strptime(s_start_date[0:-4], "%Y-%m-%d %H:%M:%S %f")    #str -> datetime
-        #start_date.strftime( '%Y-%m-%d %H:%M:%S %f')                  #datetime -> str
         row = {
             'id': job.id,
             'name': job.name,
@@ -182,27 +192,34 @@ class DbJobStore(BaseJobStore):
             'trigger_type': '',
             'crontab': '',
             'interval': 0,
-            'run_date': '',
-            'start_date': '',
-            'end_date': '',
-            'next_run_time': datetime_to_utc_timestamp(job.next_run_time),
+            'run_date': None,
+            'start_date': None,
+            'end_date': None,
+            'next_run_time': job.next_run_time,
             'max_instances': job.max_instances, 
             'executor': job.executor, 
             'misfire_grace_time': job.misfire_grace_time, 
         }
         if isinstance(job.trigger, DateTrigger):
             row['trigger_type'] = 'date'
-            row['run_date'] = job.trigger.run_date.strftime( '%Y-%m-%d %H:%M:%S %f')
+            row['run_date'] = job.trigger.run_date
 
         if isinstance(job.trigger, CronTrigger):
+            cronSort = ['second', 'minute', 'hour', 'day', 'month', 'day_of_week', 'week', 'year']
+            dt = {i.name:str(i) for i in job.trigger.fields}
+            crontab = {'keys':[], 'values':[]}
+            for k in cronSort:
+                crontab['keys'].append(cronMap[k])
+                crontab['values'].append(dt[k])
+
             row['trigger_type'] = 'cron'
-            row['crontab'] =  json.dumps({i.name:str(i) for i in job.trigger.fields})
-            row['start_date'] =  job.trigger.start_date.strftime( '%Y-%m-%d %H:%M:%S %f') if job.trigger.start_date else ''
-            row['end_date'] =  job.trigger.start_date.strftime( '%Y-%m-%d %H:%M:%S %f') if job.trigger.start_date else ''
+            row['crontab'] =  " ".join(list(crontab['values']))+','+"".join(list(crontab['keys']))
+            row['start_date'] =  job.trigger.start_date
+            row['end_date'] =  job.trigger.start_date
 
         if isinstance(job.trigger, IntervalTrigger):
             row['trigger_type'] = 'interval'
             row['interval'] = job.trigger.interval.seconds
-            row['start_date'] =  job.trigger.start_date.strftime( '%Y-%m-%d %H:%M:%S %f') if job.trigger.start_date else ''
-            row['end_date'] =  job.trigger.start_date.strftime( '%Y-%m-%d %H:%M:%S %f') if job.trigger.start_date else ''
+            row['start_date'] =  job.trigger.start_date
+            row['end_date'] =  job.trigger.start_date
         return row
